@@ -44,6 +44,7 @@ from pyannote.audio import Pipeline
 from PySide6.QtCore import QObject, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPen
 from PySide6.QtWidgets import (
+    QCheckBox,
     QDialog,
     QHBoxLayout,
     QInputDialog,
@@ -100,6 +101,14 @@ class CaptionColors(PersistentPropertiesMixin, QObject):
         self._text_color = QColor(text_color)
         self._highlight_color = QColor(highlight_color)
 
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, CaptionColors):
+            return False
+        return (
+            self._text_color == other._text_color
+            and self._highlight_color == other._highlight_color
+        )
+
     @property
     def text_color(self) -> QColor:
         return self._text_color
@@ -131,15 +140,19 @@ class CaptionColorsWidget(PropertyWidget):
     def __init__(self) -> None:
         super().__init__()
         self._value = CaptionColors()
+        self._updating = False
 
         layout = QHBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(6)
 
-        self.label_text = QLabel("Color:")
+        layout.addStretch(1)
+        self.label_text = QLabel("Color")
         self.widget_text = ColorWidget()
-        self.label_hl = QLabel("Highlight:")
+        self.widget_text.spacer.setVisible(False)
+        self.label_hl = QLabel("Highlight")
         self.widget_hl = ColorWidget()
+        self.widget_hl.spacer.setVisible(False)
 
         layout.addWidget(self.label_text)
         layout.addWidget(self.widget_text)
@@ -153,14 +166,18 @@ class CaptionColorsWidget(PropertyWidget):
         self.widget_hl.value_changed.connect(self._on_hl_changed)
 
     def _on_text_changed(self, col: QColor) -> None:
-        if self._value is not None:
-            self._value.text_color = col
-            self.value_changed.emit(self._value)
+        if self._updating:
+            return
+        new_val = CaptionColors(col, self._value.highlight_color)
+        self._value = new_val
+        self.value_changed.emit(new_val)
 
     def _on_hl_changed(self, col: QColor) -> None:
-        if self._value is not None:
-            self._value.highlight_color = col
-            self.value_changed.emit(self._value)
+        if self._updating:
+            return
+        new_val = CaptionColors(self._value.text_color, col)
+        self._value = new_val
+        self.value_changed.emit(new_val)
 
     @property
     def value(self) -> CaptionColors:
@@ -168,12 +185,19 @@ class CaptionColorsWidget(PropertyWidget):
 
     @value.setter
     def value(self, val: CaptionColors | dict) -> None:
-        if isinstance(val, dict):
-            self._value.__setstate__(val)
-        elif isinstance(val, CaptionColors):
-            self._value = val
-        self.widget_text.value = self._value.text_color
-        self.widget_hl.value = self._value.highlight_color
+        self._updating = True
+        try:
+            if isinstance(val, dict):
+                self._value = CaptionColors(
+                    val.get("text_color", "#FFFFFF"),
+                    val.get("highlight_color", "#FFD600"),
+                )
+            elif isinstance(val, CaptionColors):
+                self._value = CaptionColors(val.text_color, val.highlight_color)
+            self.widget_text.value = self._value.text_color
+            self.widget_hl.value = self._value.highlight_color
+        finally:
+            self._updating = False
 
 
 class CaptionStyle(PersistentPropertiesMixin, QObject):
@@ -199,7 +223,7 @@ class CaptionStyle(PersistentPropertiesMixin, QObject):
         self.changed.emit()
 
     @property
-    @property_params(label="Colors", widget=CaptionColorsWidget)
+    @property_params(label="Color", widget=CaptionColorsWidget)
     def colors(self) -> CaptionColors:
         return self._colors
 
@@ -264,9 +288,43 @@ class CollapsibleGroupWidget(PropertyWidget):
         super().__init__()
         self.form = PropertyForm.from_type(target_type)
         self.expander = Expander(title=title, content_widget=self.form, expanded=expanded)
+        self.expander.layout().setContentsMargins(0, 0, 0, 0)
+        self.setObjectName("CollapsibleGroupWidget")
+        self.setStyleSheet("""
+            CollapsibleGroupWidget Expander {
+                padding-top: 0px; 
+                padding-bottom: 0px;
+            }
+
+            CollapsibleGroupWidget Expander Expander {
+                padding-top: 0px; 
+                padding-bottom: 0px;
+            }
+
+            CollapsibleGroupWidget QLabel#ExpanderName {
+                color: #a09fa6;
+            }
+        """)
         self.grid_layout.addWidget(self.expander, 0, 0)
         self.form.value_changed.connect(self.value_changed.emit)
         self.form.property_changed.connect(lambda n, v: self.value_changed.emit(self.value))
+
+    def on_bind(self, instance: Any) -> None:
+        super().on_bind(instance)
+        enable_prop = self.source_params.get("enable_prop")
+        if enable_prop and hasattr(instance, enable_prop):
+            self.checkbox = QCheckBox()
+            self.checkbox.setChecked(bool(getattr(instance, enable_prop)))
+            self.checkbox.toggled.connect(
+                lambda val: setattr(instance, enable_prop, val)
+            )
+            if hasattr(instance, "changed") and hasattr(instance.changed, "connect"):
+                instance.changed.connect(
+                    lambda: self.checkbox.setChecked(bool(getattr(instance, enable_prop)))
+                    if hasattr(self, "checkbox") and self.checkbox.isChecked() != bool(getattr(instance, enable_prop))
+                    else None
+                )
+            self.expander.controls_layout.addWidget(self.checkbox)
 
     @property
     def value(self) -> object:
@@ -364,7 +422,7 @@ class TranscribePlugin(Plugin):
         self.changed.emit()
 
     @property
-    @property_params(label="Display Captions")
+    @property_params(widget=None)
     def enabled(self) -> bool:
         """Display Captions"""
         return self._enabled
@@ -375,7 +433,12 @@ class TranscribePlugin(Plugin):
         self.changed.emit()
 
     @property
-    @property_params(primary=True, widget=CollapsibleGroupWidget, label="Caption Style")
+    @property_params(
+        primary=True,
+        widget=CollapsibleGroupWidget,
+        label="Display Captions",
+        enable_prop="enabled",
+    )
     def caption_style(self) -> CaptionStyle:
         return self._caption_style
 
