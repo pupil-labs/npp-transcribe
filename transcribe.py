@@ -45,7 +45,9 @@ from PySide6.QtCore import QObject, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPen
 from PySide6.QtWidgets import (
     QDialog,
+    QHBoxLayout,
     QInputDialog,
+    QLabel,
     QLineEdit,
     QPushButton,
     QTextEdit,
@@ -56,7 +58,12 @@ from qt_property_widgets.utilities import (
     action_params,
     property_params,
 )
-from qt_property_widgets.widgets import Expander, PropertyForm, PropertyWidget
+from qt_property_widgets.widgets import (
+    ColorWidget,
+    Expander,
+    PropertyForm,
+    PropertyWidget,
+)
 
 logger = logging.getLogger(__name__)
 logging.getLogger("numba").setLevel(logging.WARNING)
@@ -79,6 +86,96 @@ class WhisperLanguage(enum.Enum):
     Arabic = "ar"
 
 
+class CaptionColors(PersistentPropertiesMixin, QObject):
+    """Pair of text and highlight colors."""
+
+    changed = Signal()
+
+    def __init__(
+        self,
+        text_color: QColor | str = "#FFFFFF",
+        highlight_color: QColor | str = "#FFD600",
+    ) -> None:
+        super().__init__()
+        self._text_color = QColor(text_color)
+        self._highlight_color = QColor(highlight_color)
+
+    @property
+    def text_color(self) -> QColor:
+        return self._text_color
+
+    @text_color.setter
+    def text_color(self, v: QColor | str) -> None:
+        self._text_color = QColor(v)
+        self.changed.emit()
+
+    @property
+    def highlight_color(self) -> QColor:
+        return self._highlight_color
+
+    @highlight_color.setter
+    def highlight_color(self, v: QColor | str) -> None:
+        self._highlight_color = QColor(v)
+        self.changed.emit()
+
+
+class CaptionColorsWidget(PropertyWidget):
+    """Places Text Color and Highlight Color widgets side-by-side on the same row."""
+
+    value_changed = Signal(object)
+
+    @staticmethod
+    def from_property_impl(prop: property) -> "CaptionColorsWidget":
+        return CaptionColorsWidget()
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._value = CaptionColors()
+
+        layout = QHBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        self.label_text = QLabel("Color:")
+        self.widget_text = ColorWidget()
+        self.label_hl = QLabel("Highlight:")
+        self.widget_hl = ColorWidget()
+
+        layout.addWidget(self.label_text)
+        layout.addWidget(self.widget_text)
+        layout.addSpacing(10)
+        layout.addWidget(self.label_hl)
+        layout.addWidget(self.widget_hl)
+
+        self.grid_layout.addLayout(layout, 0, 0)
+
+        self.widget_text.value_changed.connect(self._on_text_changed)
+        self.widget_hl.value_changed.connect(self._on_hl_changed)
+
+    def _on_text_changed(self, col: QColor) -> None:
+        if self._value is not None:
+            self._value.text_color = col
+            self.value_changed.emit(self._value)
+
+    def _on_hl_changed(self, col: QColor) -> None:
+        if self._value is not None:
+            self._value.highlight_color = col
+            self.value_changed.emit(self._value)
+
+    @property
+    def value(self) -> CaptionColors:
+        return self._value
+
+    @value.setter
+    def value(self, val: CaptionColors | dict) -> None:
+        if isinstance(val, dict):
+            self._value.__setstate__(val)
+        elif isinstance(val, CaptionColors):
+            self._value = val
+        self.widget_text.value = self._value.text_color
+        self.widget_hl.value = self._value.highlight_color
+
+
 class CaptionStyle(PersistentPropertiesMixin, QObject):
     """Caption appearance and style settings."""
 
@@ -87,8 +184,8 @@ class CaptionStyle(PersistentPropertiesMixin, QObject):
     def __init__(self) -> None:
         super().__init__()
         self._font_size = 32
-        self._text_color = QColor("#FFFFFF")
-        self._highlight_color = QColor("#FFD600")
+        self._colors = CaptionColors()
+        self._colors.changed.connect(self.changed.emit)
 
     @property
     @property_params(label="Font Size", min=10, max=100)
@@ -102,24 +199,37 @@ class CaptionStyle(PersistentPropertiesMixin, QObject):
         self.changed.emit()
 
     @property
+    @property_params(label="Colors", widget=CaptionColorsWidget)
+    def colors(self) -> CaptionColors:
+        return self._colors
+
+    @colors.setter
+    def colors(self, v: CaptionColors | dict) -> None:
+        if isinstance(v, dict):
+            self._colors.__setstate__(v)
+        elif isinstance(v, CaptionColors):
+            self._colors = v
+            self._colors.changed.connect(self.changed.emit)
+        self.changed.emit()
+
+    # Backward compatibility proxies
+    @property
+    @property_params(widget=None, dont_encode=True)
     def text_color(self) -> QColor:
-        """Text Color"""
-        return self._text_color
+        return self._colors.text_color
 
     @text_color.setter
-    def text_color(self, v: QColor) -> None:
-        self._text_color = QColor(v)
-        self.changed.emit()
+    def text_color(self, v: QColor | str) -> None:
+        self._colors.text_color = v
 
     @property
+    @property_params(widget=None, dont_encode=True)
     def highlight_color(self) -> QColor:
-        """Current Word Highlight Color"""
-        return self._highlight_color
+        return self._colors.highlight_color
 
     @highlight_color.setter
-    def highlight_color(self, v: QColor) -> None:
-        self._highlight_color = QColor(v)
-        self.changed.emit()
+    def highlight_color(self, v: QColor | str) -> None:
+        self._colors.highlight_color = v
 
 
 class CollapsibleGroupWidget(PropertyWidget):
