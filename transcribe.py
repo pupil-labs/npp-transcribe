@@ -41,7 +41,7 @@ import soundfile as sf
 from pupil_labs.neon_player import Plugin, ProgressUpdate, action
 from pupil_labs.neon_player.plugins.events import EventsPlugin
 from pyannote.audio import Pipeline
-from PySide6.QtCore import QRectF, Qt
+from PySide6.QtCore import QObject, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPen
 from PySide6.QtWidgets import (
     QDialog,
@@ -51,7 +51,12 @@ from PySide6.QtWidgets import (
     QTextEdit,
     QVBoxLayout,
 )
-from qt_property_widgets.utilities import action_params, property_params
+from qt_property_widgets.utilities import (
+    PersistentPropertiesMixin,
+    action_params,
+    property_params,
+)
+from qt_property_widgets.widgets import Expander, PropertyForm, PropertyWidget
 
 logger = logging.getLogger(__name__)
 logging.getLogger("numba").setLevel(logging.WARNING)
@@ -72,6 +77,94 @@ class WhisperLanguage(enum.Enum):
     Russian = "ru"
     Korean = "ko"
     Arabic = "ar"
+
+
+class CaptionStyle(PersistentPropertiesMixin, QObject):
+    """Caption appearance and style settings."""
+
+    changed = Signal()
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._font_size = 32
+        self._text_color = QColor("#FFFFFF")
+        self._highlight_color = QColor("#FFD600")
+
+    @property
+    @property_params(label="Font Size", min=10, max=100)
+    def font_size(self) -> int:
+        """Subtitle Font Size"""
+        return self._font_size
+
+    @font_size.setter
+    def font_size(self, v: int) -> None:
+        self._font_size = int(v)
+        self.changed.emit()
+
+    @property
+    def text_color(self) -> QColor:
+        """Text Color"""
+        return self._text_color
+
+    @text_color.setter
+    def text_color(self, v: QColor) -> None:
+        self._text_color = QColor(v)
+        self.changed.emit()
+
+    @property
+    def highlight_color(self) -> QColor:
+        """Current Word Highlight Color"""
+        return self._highlight_color
+
+    @highlight_color.setter
+    def highlight_color(self, v: QColor) -> None:
+        self._highlight_color = QColor(v)
+        self.changed.emit()
+
+
+class CollapsibleGroupWidget(PropertyWidget):
+    """Renders a custom type inside a collapsible Expander section."""
+
+    value_changed = Signal(object)
+
+    @staticmethod
+    def from_property_impl(prop: property) -> "CollapsibleGroupWidget":
+        target_type = None
+        if hasattr(prop, "fget") and prop.fget:
+            try:
+                import typing as T
+                target_type = T.get_type_hints(prop.fget).get("return")
+            except Exception:
+                pass
+            if target_type is None or isinstance(target_type, str):
+                hints = getattr(prop.fget, "__annotations__", {})
+                ret = hints.get("return")
+                if isinstance(ret, type):
+                    target_type = ret
+                elif isinstance(ret, str) and hasattr(prop.fget, "__globals__"):
+                    target_type = prop.fget.__globals__.get(ret, object)
+        if target_type is None or not isinstance(target_type, type):
+            target_type = object
+
+        params = getattr(prop.fget, "parameters", {}) if hasattr(prop, "fget") and prop.fget else {}
+        title = params.get("label") or (prop.fget.__name__.replace("_", " ").title() if hasattr(prop, "fget") and prop.fget else "")
+        return CollapsibleGroupWidget(target_type, title=title)
+
+    def __init__(self, target_type: type, title: str = "", expanded: bool = False) -> None:
+        super().__init__()
+        self.form = PropertyForm.from_type(target_type)
+        self.expander = Expander(title=title, content_widget=self.form, expanded=expanded)
+        self.grid_layout.addWidget(self.expander, 0, 0)
+        self.form.value_changed.connect(self.value_changed.emit)
+        self.form.property_changed.connect(lambda n, v: self.value_changed.emit(self.value))
+
+    @property
+    def value(self) -> object:
+        return self.form.value
+
+    @value.setter
+    def value(self, v: object) -> None:
+        self.form.value = v
 
 
 _SPEAKER_COLORS = [
@@ -113,74 +206,24 @@ class TranscribePlugin(Plugin):
         self._words: list[dict[str, Any]] = []
         self._segments: list[dict[str, Any]] = []
         self._model = "mlx-community/whisper-large-v3-turbo"
-        self._enabled = True
-        self._font_size = 32
-        self._text_color = QColor("#FFFFFF")
-        self._highlight_color = QColor("#FFD600")
-        self._bg_color = QColor(0, 0, 0, 150)
         self._audio_stream_idx = 0
         self._language = WhisperLanguage.Auto
         self._diarize = False
+        self._enabled = True
+        self._caption_style = CaptionStyle()
+        self._caption_style.changed.connect(self.changed.emit)
+        self._bg_color = QColor(0, 0, 0, 150)
 
     def on_recording_loaded(self, recording: Any) -> None:
         self._words = []
         self._segments = []
-        cache_file = self.get_cache_path() / "transcription.json"
-        if cache_file.exists():
-            try:
-                with open(cache_file) as f:
-                    data = json.load(f)
-                self._words = data.get("words", [])
-                self._segments = data.get("segments", [])
-            except (json.JSONDecodeError, OSError):
-                logger.exception("Failed to load transcription cache")
+        data = self.load_cached_json("transcription.json")
+        if data and isinstance(data, dict):
+            self._words = data.get("words", [])
+            self._segments = data.get("segments", [])
 
     @property
-    @property_params(order=1)
-    def enabled(self) -> bool:
-        """Show Subtitles"""
-        return self._enabled
-
-    @enabled.setter
-    def enabled(self, v: bool):
-        self._enabled = v
-        self.changed.emit()
-
-    @property
-    @property_params(order=2, min=10, max=100)
-    def font_size(self) -> int:
-        """Subtitle Font Size"""
-        return self._font_size
-
-    @font_size.setter
-    def font_size(self, v: int):
-        self._font_size = v
-        self.changed.emit()
-
-    @property
-    @property_params(order=3)
-    def text_color(self) -> QColor:
-        """Text Color"""
-        return self._text_color
-
-    @text_color.setter
-    def text_color(self, v: QColor):
-        self._text_color = QColor(v)
-        self.changed.emit()
-
-    @property
-    @property_params(order=4)
-    def highlight_color(self) -> QColor:
-        """Current Word Highlight Color"""
-        return self._highlight_color
-
-    @highlight_color.setter
-    def highlight_color(self, v: QColor):
-        self._highlight_color = QColor(v)
-        self.changed.emit()
-
-    @property
-    @property_params(order=5, min=0, max=7)
+    @property_params(min=0, max=7)
     def audio_stream_idx(self) -> int:
         """Audio Channel Index"""
         return self._audio_stream_idx
@@ -191,7 +234,6 @@ class TranscribePlugin(Plugin):
         self.changed.emit()
 
     @property
-    @property_params(order=6)
     def language(self) -> WhisperLanguage:
         """Transcription Language"""
         return self._language
@@ -202,7 +244,6 @@ class TranscribePlugin(Plugin):
         self.changed.emit()
 
     @property
-    @property_params(order=7)
     def diarize(self) -> bool:
         """Speaker Diarization (requires HF token)"""
         return self._diarize
@@ -211,6 +252,59 @@ class TranscribePlugin(Plugin):
     def diarize(self, v: bool) -> None:
         self._diarize = v
         self.changed.emit()
+
+    @property
+    @property_params(label="Display Captions")
+    def enabled(self) -> bool:
+        """Display Captions"""
+        return self._enabled
+
+    @enabled.setter
+    def enabled(self, v: bool):
+        self._enabled = v
+        self.changed.emit()
+
+    @property
+    @property_params(primary=True, widget=CollapsibleGroupWidget, label="Caption Style")
+    def caption_style(self) -> CaptionStyle:
+        return self._caption_style
+
+    @caption_style.setter
+    def caption_style(self, value: CaptionStyle | dict) -> None:
+        if isinstance(value, dict):
+            self._caption_style.__setstate__(value)
+        elif isinstance(value, CaptionStyle):
+            self._caption_style = value
+            self._caption_style.changed.connect(self.changed.emit)
+        self.changed.emit()
+
+    # Backward compatibility proxies
+    @property
+    @property_params(widget=None, dont_encode=True)
+    def font_size(self) -> int:
+        return self._caption_style.font_size
+
+    @font_size.setter
+    def font_size(self, v: int) -> None:
+        self._caption_style.font_size = int(v)
+
+    @property
+    @property_params(widget=None, dont_encode=True)
+    def text_color(self) -> QColor:
+        return self._caption_style.text_color
+
+    @text_color.setter
+    def text_color(self, v: QColor) -> None:
+        self._caption_style.text_color = QColor(v)
+
+    @property
+    @property_params(widget=None, dont_encode=True)
+    def highlight_color(self) -> QColor:
+        return self._caption_style.highlight_color
+
+    @highlight_color.setter
+    def highlight_color(self, v: QColor) -> None:
+        self._caption_style.highlight_color = QColor(v)
 
     @action
     @action_params(compact=True, icon=QIcon.fromTheme("dialog-password"))
@@ -232,9 +326,9 @@ class TranscribePlugin(Plugin):
     @action_params(compact=True, icon=QIcon.fromTheme("media-playback-start"))
     def transcribe_audio(self) -> None:
         """Transcribe Audio (Whisper Turbo + Word Timestamps)"""
-        cache_file = self.get_cache_path() / "transcription.json"
-        if cache_file.exists():
-            cache_file.unlink()
+        cache_path = self.get_cache_path()
+        if cache_path is not None:
+            (cache_path / "transcription.json").unlink(missing_ok=True)
 
         self.job = self.job_manager.run_background_action(
             "Transcribing Audio", "TranscribePlugin.bg_transcribe"
@@ -459,10 +553,7 @@ class TranscribePlugin(Plugin):
                     words = self._run_diarization(audio_path, words, hf_token)
 
             yield ProgressUpdate(0.9, "Saving cache...")
-            cache_file = self.get_cache_path() / "transcription.json"
-            cache_file.parent.mkdir(parents=True, exist_ok=True)
-            with open(cache_file, "w") as f:
-                json.dump({"words": words, "segments": segments}, f)
+            self.save_cached_json("transcription.json", {"words": words, "segments": segments})
 
             yield ProgressUpdate(1.0, "Done")
 
@@ -553,7 +644,7 @@ class TranscribePlugin(Plugin):
         active_word = self._words[active_idx].get("word", "").strip()
         active_in_window = active_idx - window_start
 
-        font = QFont("Arial", self._font_size, QFont.Weight.Normal)
+        font = QFont("Arial", self.font_size, QFont.Weight.Normal)
         painter.setFont(font)
         fm = painter.fontMetrics()
 
@@ -592,7 +683,7 @@ class TranscribePlugin(Plugin):
             )
             text_col = _SPEAKER_COLORS[speaker_idx % len(_SPEAKER_COLORS)]
         else:
-            text_col = self._text_color
+            text_col = self.text_color
 
         painter.setPen(QPen(text_col))
         painter.drawText(bounding_rect, flags, display_text)
@@ -609,7 +700,7 @@ class TranscribePlugin(Plugin):
             word_w,
             bounding_rect.height(),
         )
-        painter.setPen(QPen(self._highlight_color))
+        painter.setPen(QPen(self.highlight_color))
         painter.drawText(
             highlight_rect,
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
