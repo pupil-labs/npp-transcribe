@@ -7,6 +7,7 @@
 #     "numpy",
 #     "soundfile",
 #     "pyannote-audio",
+#     "keyring>=25.7.0",
 # ]
 #
 # [tool.uv.sources]
