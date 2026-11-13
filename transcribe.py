@@ -21,7 +21,7 @@ Algorithms:
 - Word Timestamps: Whisper DTW-based forced alignment (word_timestamps=True)
 - Speaker Diarization: pyannote.audio speaker-diarization-3.1 pipeline
   (requires a HuggingFace access token with pyannote model agreement)
-- Resampling: librosa Kaiser-best resampler (orig_sr -> 16 kHz)
+- Resampling: in-memory PyAV AudioResampler (orig_sr -> 16 kHz mono float32)
 - Timestamp Normalization: first-frame UNIX epoch offset vs recording.start_time
 """
 
@@ -30,27 +30,12 @@ from __future__ import annotations
 import enum
 import json
 import logging
-import os
-import shutil
 import sys
 import tempfile
 from collections.abc import Generator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-
-# Ensure standard tool paths (Homebrew, local bin) are in PATH on macOS
-for _candidate_path in [
-    "/opt/homebrew/bin",
-    "/opt/homebrew/sbin",
-    "/usr/local/bin",
-    "/usr/local/sbin",
-    "/opt/local/bin",
-    os.path.expanduser("~/bin"),
-    os.path.expanduser("~/.local/bin"),
-]:
-    if _candidate_path not in os.environ.get("PATH", "").split(os.pathsep) and os.path.isdir(_candidate_path):
-        os.environ["PATH"] = f"{_candidate_path}{os.pathsep}{os.environ.get('PATH', '')}"
 
 import keyring
 import numpy as np
@@ -649,8 +634,8 @@ class TranscribePlugin(Plugin):
         dialog.setLayout(layout)
         dialog.exec()
 
-    def _extract_audio_to_file(self) -> tuple[str, float, float]:
-        """Extract audio stream, convert to mono float32, compute offset, and save to a temporary WAV file to save RAM."""
+    def _extract_audio_waveform(self) -> tuple[np.ndarray, float]:
+        """Decodes and resamples audio directly to 16 kHz mono float32 in memory via PyAV."""
         if not hasattr(self.recording, "audio") or self.recording.audio is None:
             raise RuntimeError("No audio stream found in recording")
 
@@ -660,88 +645,76 @@ class TranscribePlugin(Plugin):
         elif hasattr(self.recording.audio, "average_rate"):
             orig_sr = float(self.recording.audio.average_rate)
 
-        tmp_file = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-        tmp_path = tmp_file.name
-        tmp_file.close()
-
         first_ts = None
-        sf_writer = None
+        chunks: list[np.ndarray] = []
 
-        try:
-            for frame in self.recording.audio:
-                if first_ts is None:
-                    first_ts = getattr(frame, "time", getattr(frame, "ts", 0.0))
+        import av
 
-                frame_np = frame.to_ndarray()
+        resampler = av.AudioResampler(format="flt", layout="mono", rate=16000)
 
-                if len(frame_np.shape) > 1:
-                    if frame_np.shape[0] < frame_np.shape[1]:
-                        # (channels, samples) -> (samples, channels)
-                        frame_np = frame_np.T
+        for frame in self.recording.audio:
+            if first_ts is None:
+                first_ts = getattr(frame, "time", getattr(frame, "ts", 0.0))
 
-                    if self._audio_stream_idx < frame_np.shape[1]:
-                        mono_chunk = frame_np[:, self._audio_stream_idx]
-                    else:
-                        mono_chunk = frame_np[:, 0]
+            frame_np = frame.to_ndarray()
+
+            if len(frame_np.shape) > 1:
+                if frame_np.shape[0] < frame_np.shape[1]:
+                    # (channels, samples) -> (samples, channels)
+                    frame_np = frame_np.T
+
+                if self._audio_stream_idx < frame_np.shape[1]:
+                    mono_chunk = frame_np[:, self._audio_stream_idx]
                 else:
-                    mono_chunk = frame_np
+                    mono_chunk = frame_np[:, 0]
+            else:
+                mono_chunk = frame_np
 
-                mono_chunk = mono_chunk.astype(np.float32)
-                max_val = np.max(np.abs(mono_chunk))
-                if max_val > 1.0:
-                    mono_chunk /= max_val
+            mono_chunk = mono_chunk.astype(np.float32)
+            if np.issubdtype(frame_np.dtype, np.integer):
+                mono_chunk /= float(np.iinfo(frame_np.dtype).max)
 
-                if sf_writer is None:
-                    sf_writer = sf.SoundFile(
-                        tmp_path, mode="w", samplerate=int(orig_sr), channels=1
-                    )
+            av_frame = av.AudioFrame.from_ndarray(
+                mono_chunk.reshape(1, -1), format="flt", layout="mono"
+            )
+            av_frame.sample_rate = int(orig_sr)
 
-                sf_writer.write(mono_chunk)
+            for rf in resampler.resample(av_frame):
+                chunks.append(rf.to_ndarray()[0])
 
-        finally:
-            if sf_writer is not None:
-                sf_writer.close()
+        for rf in resampler.resample(None):
+            chunks.append(rf.to_ndarray()[0])
 
-        if first_ts is None:
+        if first_ts is None or not chunks:
             raise RuntimeError("Failed to decode audio (no frames)")
+
+        audio_16k = np.concatenate(chunks)
+        max_val = np.max(np.abs(audio_16k))
+        if max_val > 1.0:
+            audio_16k /= max_val
 
         audio_time_offset = _compute_audio_time_offset(
             first_ts, self.recording.start_time
         )
 
-        return tmp_path, orig_sr, audio_time_offset
+        return audio_16k, audio_time_offset
 
     def bg_transcribe(self) -> Generator[ProgressUpdate, None, None]:
         yield ProgressUpdate(0.0, "Extracting audio via pl-neon-recording...")
 
-        audio_path = None
         try:
-            audio_path, orig_sr, audio_time_offset = self._extract_audio_to_file()
+            audio_16k, audio_time_offset = self._extract_audio_waveform()
 
             lang_val = (
                 None if self._language == WhisperLanguage.Auto else self._language.value
             )
-
-            # Ensure 16 kHz numpy audio if ffmpeg CLI is unavailable
-            whisper_audio: str | np.ndarray = audio_path
-            if not shutil.which("ffmpeg"):
-                try:
-                    data, sr = sf.read(audio_path, dtype="float32")
-                    if len(data.shape) > 1:
-                        data = np.mean(data, axis=1)
-                    if sr != 16000:
-                        import librosa
-                        data = librosa.resample(data, orig_sr=sr, target_sr=16000)
-                    whisper_audio = data
-                except Exception as e:
-                    logger.warning(f"Audio read/resample fallback failed: {e}")
 
             if sys.platform == "darwin":
                 yield ProgressUpdate(0.2, "Transcribing with Whisper Turbo (Metal)...")
                 import mlx_whisper
 
                 result = mlx_whisper.transcribe(
-                    whisper_audio,
+                    audio_16k,
                     path_or_hf_repo=self._model,
                     word_timestamps=True,
                     language=lang_val,
@@ -753,7 +726,7 @@ class TranscribePlugin(Plugin):
                 model = whisper.load_model("turbo")
                 yield ProgressUpdate(0.3, "Transcribing with standard Whisper...")
                 result = model.transcribe(
-                    whisper_audio,
+                    audio_16k,
                     word_timestamps=True,
                     language=lang_val,
                 )
@@ -784,7 +757,7 @@ class TranscribePlugin(Plugin):
                     )
                 else:
                     yield ProgressUpdate(0.7, "Running speaker diarization...")
-                    words = self._run_diarization(audio_path, words, hf_token)
+                    words = self._run_diarization(audio_16k, words, hf_token)
 
             yield ProgressUpdate(0.9, "Saving cache...")
             self.save_cached_json("transcription.json", {"words": words, "segments": segments})
@@ -795,10 +768,6 @@ class TranscribePlugin(Plugin):
             logger.exception("Failed during transcription process")
             raise
         finally:
-            # Free large ML models and empty GPU memory caches
-            if audio_path is not None:
-                Path(audio_path).unlink(missing_ok=True)
-
             if "model" in locals():
                 del model
             if "result" in locals():
@@ -825,19 +794,31 @@ class TranscribePlugin(Plugin):
                     pass
 
     def _run_diarization(
-        self, audio_path: str, words: list[dict[str, Any]], hf_token: str
+        self, audio_data: np.ndarray, words: list[dict[str, Any]], hf_token: str
     ) -> list[dict[str, Any]]:
         """Runs pyannote/speaker-diarization-3.1.
 
         Assigns a speaker label to each word by finding the diarization
         segment whose time range contains the word midpoint (greedy nearest match).
         """
+        import torch
+
         pipeline = Pipeline.from_pretrained(
             "pyannote/speaker-diarization-3.1",
             use_auth_token=hf_token,
         )
 
-        diarization = pipeline(audio_path)
+        waveform = torch.from_numpy(audio_data).unsqueeze(0)
+        try:
+            diarization = pipeline({"waveform": waveform, "sample_rate": 16000})
+        except Exception:
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+                temp_wav = f.name
+            try:
+                sf.write(temp_wav, audio_data, 16000)
+                diarization = pipeline(temp_wav)
+            finally:
+                Path(temp_wav).unlink(missing_ok=True)
 
         dia_segments = [
             (turn.start, turn.end, speaker)
