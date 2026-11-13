@@ -30,12 +30,27 @@ from __future__ import annotations
 import enum
 import json
 import logging
+import os
+import shutil
 import sys
 import tempfile
 from collections.abc import Generator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+# Ensure standard tool paths (Homebrew, local bin) are in PATH on macOS
+for _candidate_path in [
+    "/opt/homebrew/bin",
+    "/opt/homebrew/sbin",
+    "/usr/local/bin",
+    "/usr/local/sbin",
+    "/opt/local/bin",
+    os.path.expanduser("~/bin"),
+    os.path.expanduser("~/.local/bin"),
+]:
+    if _candidate_path not in os.environ.get("PATH", "").split(os.pathsep) and os.path.isdir(_candidate_path):
+        os.environ["PATH"] = f"{_candidate_path}{os.pathsep}{os.environ.get('PATH', '')}"
 
 import keyring
 import numpy as np
@@ -707,12 +722,26 @@ class TranscribePlugin(Plugin):
                 None if self._language == WhisperLanguage.Auto else self._language.value
             )
 
+            # Ensure 16 kHz numpy audio if ffmpeg CLI is unavailable
+            whisper_audio: str | np.ndarray = audio_path
+            if not shutil.which("ffmpeg"):
+                try:
+                    data, sr = sf.read(audio_path, dtype="float32")
+                    if len(data.shape) > 1:
+                        data = np.mean(data, axis=1)
+                    if sr != 16000:
+                        import librosa
+                        data = librosa.resample(data, orig_sr=sr, target_sr=16000)
+                    whisper_audio = data
+                except Exception as e:
+                    logger.warning(f"Audio read/resample fallback failed: {e}")
+
             if sys.platform == "darwin":
                 yield ProgressUpdate(0.2, "Transcribing with Whisper Turbo (Metal)...")
                 import mlx_whisper
 
                 result = mlx_whisper.transcribe(
-                    audio_path,
+                    whisper_audio,
                     path_or_hf_repo=self._model,
                     word_timestamps=True,
                     language=lang_val,
@@ -724,7 +753,7 @@ class TranscribePlugin(Plugin):
                 model = whisper.load_model("turbo")
                 yield ProgressUpdate(0.3, "Transcribing with standard Whisper...")
                 result = model.transcribe(
-                    audio_path,
+                    whisper_audio,
                     word_timestamps=True,
                     language=lang_val,
                 )
