@@ -648,9 +648,23 @@ class TranscribePlugin(Plugin):
             return
 
         event_name = f"Spoke: {keyword}"
-        events_plugin.add_events({event_name: deduped})
+        existing_ts = events_plugin.events.get(event_name, [])
+        new_events = [
+            ts
+            for ts in deduped
+            if not any(abs(ts - int(ex)) <= 100_000_000 for ex in existing_ts)
+        ]
+
+        if not new_events:
+            self.app.show_notification(
+                "Keyword Search",
+                f"All {len(deduped)} event(s) for '{keyword}' already exist.",
+            )
+            return
+
+        events_plugin.add_events({event_name: new_events})
         self.app.show_notification(
-            "Events Created", f"Added {len(deduped)} event(s) for '{keyword}'."
+            "Events Created", f"Added {len(new_events)} event(s) for '{keyword}'."
         )
 
     @action
@@ -985,10 +999,21 @@ class TranscribePlugin(Plugin):
 
         active_idx = None
         for i, w in enumerate(self._words):
-            # 0.4s trailing hold window prevents subtitle flickering during natural pauses
-            if w["start"] <= time_s <= (w["end"] + 0.4):
+            if w["start"] <= time_s <= w["end"]:
                 active_idx = i
                 break
+
+        if active_idx is None:
+            # Hold previous word briefly during pauses between words without stealing from the next word
+            for i, w in enumerate(self._words):
+                next_start = (
+                    self._words[i + 1]["start"]
+                    if i + 1 < len(self._words)
+                    else float("inf")
+                )
+                if w["end"] < time_s <= min(w["end"] + 0.4, next_start):
+                    active_idx = i
+                    break
 
         if active_idx is None:
             return
