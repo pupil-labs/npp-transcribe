@@ -30,6 +30,7 @@ from __future__ import annotations
 import enum
 import json
 import logging
+import re
 import sys
 import tempfile
 from collections.abc import Generator
@@ -421,6 +422,20 @@ class TranscribePlugin(Plugin):
         if data and isinstance(data, dict):
             self._words = data.get("words", [])
             self._segments = data.get("segments", [])
+            rec_start_ns = int(getattr(recording, "start_time", 0))
+            if rec_start_ns:
+                for w in self._words:
+                    if "start_time_ns" not in w and "start" in w:
+                        w["start_time_ns"] = rec_start_ns + int(w["start"] * 1e9)
+                        w["timestamp_ns"] = w["start_time_ns"]
+                    if "end_time_ns" not in w and "end" in w:
+                        w["end_time_ns"] = rec_start_ns + int(w["end"] * 1e9)
+                for s in self._segments:
+                    if "start_time_ns" not in s and "start" in s:
+                        s["start_time_ns"] = rec_start_ns + int(s["start"] * 1e9)
+                        s["timestamp_ns"] = s["start_time_ns"]
+                    if "end_time_ns" not in s and "end" in s:
+                        s["end_time_ns"] = rec_start_ns + int(s["end"] * 1e9)
 
     @property
     @property_params(min=0, max=7)
@@ -543,52 +558,106 @@ class TranscribePlugin(Plugin):
     def _on_transcribed(self) -> None:
         self.on_recording_loaded(self.recording)
         self.changed.emit()
-        if self._words:
+        count = len(self._words) if self._words else len(self._segments)
+        label = "words" if self._words else "segments"
+        if count > 0:
             self.app.show_notification(
-                "Transcription", f"Transcribed {len(self._words)} words."
+                "Transcription", f"Transcribed {count} {label} successfully."
+            )
+        else:
+            self.app.show_notification(
+                "Transcription", "Transcription complete (no speech detected)."
             )
 
     @action
     @action_params(compact=True, icon=QIcon.fromTheme("edit-find"))
     def create_events_from_keyword(self) -> None:
         """Create Events from Keyword"""
-        if not self._words:
+        if not self._words and not self._segments:
             self.app.show_notification("Notice", "Please transcribe the audio first.")
             return
 
         keyword, ok = QInputDialog.getText(
-            None, "Keyword Search", "Enter keyword to search for in transcription:"
+            None, "Keyword Search", "Enter keyword or phrase to search for:"
         )
-        if not ok or not keyword:
+        if not ok or not keyword or not keyword.strip():
             return
 
-        keyword = keyword.lower().strip()
+        keyword = keyword.strip()
+        kw_tokens = [t.lower() for t in re.findall(r"[\w']+", keyword)]
+        if not kw_tokens:
+            self.app.show_notification("Notice", "Invalid search query.")
+            return
+
         events_plugin: EventsPlugin = Plugin.get_instance_by_name("EventsPlugin")
         if not events_plugin:
             self.app.show_notification("Error", "EventsPlugin not loaded.")
             return
 
+        rec_start = int(getattr(self.recording, "start_time", 0))
+        timestamps: list[int] = []
+
+        # 1. Search word-level timestamps (exact token sequence)
+        if self._words:
+            clean_words = [
+                (i, re.sub(r"^[^\w']+|[^\w']+$", "", w.get("word", "").strip().lower()))
+                for i, w in enumerate(self._words)
+            ]
+            n_kw = len(kw_tokens)
+            for i in range(len(clean_words) - n_kw + 1):
+                window = [cw[1] for cw in clean_words[i : i + n_kw]]
+                if window == kw_tokens:
+                    w_match = self._words[clean_words[i][0]]
+                    ts_ns = w_match.get("start_time_ns")
+                    if ts_ns is None:
+                        ts_ns = rec_start + int(w_match.get("start", 0.0) * 1e9)
+                    timestamps.append(int(ts_ns))
+
+        # 2. Fallback to segment-level search if word timestamps were unavailable
+        elif self._segments:
+            pattern = re.compile(
+                r"\b" + r"\s+".join(re.escape(t) for t in kw_tokens) + r"\b",
+                re.IGNORECASE,
+            )
+            for seg in self._segments:
+                text = seg.get("text", "")
+                for m in pattern.finditer(text):
+                    seg_start_ns = seg.get("start_time_ns")
+                    if seg_start_ns is None:
+                        seg_start_ns = rec_start + int(seg.get("start", 0.0) * 1e9)
+                    seg_end_ns = seg.get("end_time_ns")
+                    if seg_end_ns is None:
+                        seg_end_ns = rec_start + int(seg.get("end", 0.0) * 1e9)
+
+                    text_len = max(len(text), 1)
+                    frac = m.start() / text_len
+                    est_ns = seg_start_ns + int(frac * (seg_end_ns - seg_start_ns))
+                    timestamps.append(int(est_ns))
+
+        # Deduplicate timestamps within 100ms
+        timestamps = sorted(set(timestamps))
+        deduped: list[int] = []
+        for ts in timestamps:
+            if not deduped or (ts - deduped[-1]) > 100_000_000:
+                deduped.append(ts)
+
+        if not deduped:
+            self.app.show_notification(
+                "Keyword Search", f"No occurrences found for '{keyword}'."
+            )
+            return
+
         event_name = f"Spoke: {keyword}"
-
-        rec_start = self.recording.start_time
-        timestamps = []
-        for w in self._words:
-            if keyword in w.get("word", "").lower():
-                ts_ns = rec_start + int(w["start"] * 1e9)
-                timestamps.append(ts_ns)
-
-        if timestamps:
-            events_plugin.add_events({event_name: timestamps})
-
+        events_plugin.add_events({event_name: deduped})
         self.app.show_notification(
-            "Events Created", f"Added {len(timestamps)} events for '{keyword}'."
+            "Events Created", f"Added {len(deduped)} event(s) for '{keyword}'."
         )
 
     @action
     @action_params(compact=True, icon=QIcon.fromTheme("text-x-generic"))
     def view_transcript(self) -> None:
         """View Full Transcript"""
-        if not self._words:
+        if not self._segments and not self._words:
             self.app.show_notification("Notice", "Please transcribe the audio first.")
             return
 
@@ -602,29 +671,40 @@ class TranscribePlugin(Plugin):
         text_edit.setFontFamily("Courier New")
 
         lines = []
-        current_speaker = None
-        line_words = []
-
-        for w in self._words:
-            speaker = w.get("speaker")
-            start = w["start"]
-            word = w.get("word", "").strip()
-
-            if speaker != current_speaker:
-                if line_words:
-                    lines.append(" ".join(line_words))
-                current_speaker = speaker
-                prefix = f"\n[{_format_time(start)}]"
+        if self._segments:
+            for seg in self._segments:
+                speaker = seg.get("speaker")
+                start = seg.get("start", 0.0)
+                text = seg.get("text", "").strip()
+                if not text:
+                    continue
+                prefix = f"[{_format_time(start)}]"
                 if speaker:
                     prefix += f" {speaker}:"
-                line_words = [prefix, word]
-            else:
-                line_words.append(word)
+                lines.append(f"{prefix} {text}")
+        else:
+            current_speaker = None
+            line_words = []
+            for w in self._words:
+                speaker = w.get("speaker")
+                start = w.get("start", 0.0)
+                word = w.get("word", "").strip()
 
-        if line_words:
-            lines.append(" ".join(line_words))
+                if speaker != current_speaker:
+                    if line_words:
+                        lines.append(" ".join(line_words))
+                    current_speaker = speaker
+                    prefix = f"\n[{_format_time(start)}]"
+                    if speaker:
+                        prefix += f" {speaker}:"
+                    line_words = [prefix, word]
+                else:
+                    line_words.append(word)
 
-        text_edit.setPlainText("\n".join(lines).strip())
+            if line_words:
+                lines.append(" ".join(line_words))
+
+        text_edit.setPlainText("\n\n".join(lines).strip())
         layout.addWidget(text_edit)
 
         btn = QPushButton("Close")
@@ -636,25 +716,34 @@ class TranscribePlugin(Plugin):
 
     def _extract_audio_waveform(self) -> tuple[np.ndarray, float]:
         """Decodes and resamples audio directly to 16 kHz mono float32 in memory via PyAV."""
-        if not hasattr(self.recording, "audio") or self.recording.audio is None:
+        audio_stream = getattr(self.recording, "audio", None)
+        if audio_stream is None or len(audio_stream) == 0:
             raise RuntimeError("No audio stream found in recording")
 
         orig_sr = 48000.0
-        if hasattr(self.recording.audio, "rate"):
-            orig_sr = float(self.recording.audio.rate)
-        elif hasattr(self.recording.audio, "average_rate"):
-            orig_sr = float(self.recording.audio.average_rate)
+        if hasattr(audio_stream, "rate"):
+            orig_sr = float(audio_stream.rate)
+        elif hasattr(audio_stream, "average_rate"):
+            orig_sr = float(audio_stream.average_rate)
 
-        first_ts = None
+        first_ts_ns: int | None = None
+        if hasattr(audio_stream, "ts") and len(audio_stream.ts) > 0:
+            first_ts_ns = int(audio_stream.ts[0])
+
         chunks: list[np.ndarray] = []
 
         import av
 
         resampler = av.AudioResampler(format="flt", layout="mono", rate=16000)
 
-        for frame in self.recording.audio:
-            if first_ts is None:
-                first_ts = getattr(frame, "time", getattr(frame, "ts", 0.0))
+        for frame in audio_stream:
+            if first_ts_ns is None:
+                try:
+                    first_ts_ns = int(frame["ts"])
+                except Exception:
+                    raw_val = getattr(frame, "time", getattr(frame, "ts", None))
+                    if raw_val is not None:
+                        first_ts_ns = int(raw_val)
 
             frame_np = frame.to_ndarray()
 
@@ -685,7 +774,7 @@ class TranscribePlugin(Plugin):
         for rf in resampler.resample(None):
             chunks.append(rf.to_ndarray()[0])
 
-        if first_ts is None or not chunks:
+        if not chunks:
             raise RuntimeError("Failed to decode audio (no frames)")
 
         audio_16k = np.concatenate(chunks)
@@ -693,9 +782,15 @@ class TranscribePlugin(Plugin):
         if max_val > 1.0:
             audio_16k /= max_val
 
-        audio_time_offset = _compute_audio_time_offset(
-            first_ts, self.recording.start_time
-        )
+        rec_start_ns = int(getattr(self.recording, "start_time", 0))
+        audio_time_offset = 0.0
+        if first_ts_ns is not None and rec_start_ns > 0:
+            if first_ts_ns > 1e17:
+                audio_time_offset = (first_ts_ns - rec_start_ns) / 1e9
+            elif first_ts_ns > 1e8:
+                audio_time_offset = (first_ts_ns - (rec_start_ns / 1e9))
+            else:
+                audio_time_offset = float(first_ts_ns)
 
         return audio_16k, audio_time_offset
 
@@ -732,35 +827,67 @@ class TranscribePlugin(Plugin):
                 )
 
             segments = result.get("segments", [])
+            rec_start_ns = int(getattr(self.recording, "start_time", 0))
 
             words: list[dict[str, Any]] = []
+            enriched_segments: list[dict[str, Any]] = []
+
             for seg in segments:
-                words.extend(
-                    {
+                seg_start_s = float(seg.get("start", 0.0) + audio_time_offset)
+                seg_end_s = float(seg.get("end", 0.0) + audio_time_offset)
+                seg_start_ns = rec_start_ns + int(seg_start_s * 1e9)
+                seg_end_ns = rec_start_ns + int(seg_end_s * 1e9)
+
+                seg_words = []
+                for w in seg.get("words", []) or []:
+                    w_start_s = float(w.get("start", 0.0) + audio_time_offset)
+                    w_end_s = float(w.get("end", 0.0) + audio_time_offset)
+                    w_start_ns = rec_start_ns + int(w_start_s * 1e9)
+                    w_end_ns = rec_start_ns + int(w_end_s * 1e9)
+                    word_entry = {
                         "word": w.get("word", ""),
-                        "start": w["start"] + audio_time_offset,
-                        "end": w["end"] + audio_time_offset,
+                        "start": round(w_start_s, 3),
+                        "end": round(w_end_s, 3),
+                        "start_time_ns": w_start_ns,
+                        "end_time_ns": w_end_ns,
+                        "timestamp_ns": w_start_ns,
                     }
-                    for w in seg.get("words", [])
+                    if "probability" in w:
+                        word_entry["probability"] = w["probability"]
+                    words.append(word_entry)
+                    seg_words.append(word_entry)
+
+                enriched_segments.append(
+                    {
+                        "id": seg.get("id"),
+                        "seek": seg.get("seek"),
+                        "start": round(seg_start_s, 3),
+                        "end": round(seg_end_s, 3),
+                        "start_time_ns": seg_start_ns,
+                        "end_time_ns": seg_end_ns,
+                        "timestamp_ns": seg_start_ns,
+                        "text": seg.get("text", "").strip(),
+                        "words": seg_words,
+                    }
                 )
-                seg["start"] += audio_time_offset
-                seg["end"] += audio_time_offset
 
             if self._diarize:
                 hf_token = keyring.get_password("neon_player", "HF_TOKEN")
                 if not hf_token:
-                    logger.error(
+                    logger.warning(
                         "HuggingFace token not found in keyring. Skipping diarization."
-                    )
-                    self.app.show_notification(
-                        "Notice", "HuggingFace token missing. Skipping diarization."
                     )
                 else:
                     yield ProgressUpdate(0.7, "Running speaker diarization...")
-                    words = self._run_diarization(audio_16k, words, hf_token)
+                    words, enriched_segments = self._run_diarization(
+                        audio_16k, words, enriched_segments, hf_token
+                    )
 
             yield ProgressUpdate(0.9, "Saving cache...")
-            self.save_cached_json("transcription.json", {"words": words, "segments": segments})
+            self.save_cached_json(
+                "transcription.json",
+                {"words": words, "segments": enriched_segments},
+            )
 
             yield ProgressUpdate(1.0, "Done")
 
@@ -794,12 +921,16 @@ class TranscribePlugin(Plugin):
                     pass
 
     def _run_diarization(
-        self, audio_data: np.ndarray, words: list[dict[str, Any]], hf_token: str
-    ) -> list[dict[str, Any]]:
+        self,
+        audio_data: np.ndarray,
+        words: list[dict[str, Any]],
+        segments: list[dict[str, Any]],
+        hf_token: str,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         """Runs pyannote/speaker-diarization-3.1.
 
-        Assigns a speaker label to each word by finding the diarization
-        segment whose time range contains the word midpoint (greedy nearest match).
+        Assigns a speaker label to each word and segment by finding the diarization
+        turn containing the item's midpoint.
         """
         import torch
 
@@ -832,14 +963,21 @@ class TranscribePlugin(Plugin):
                     w["speaker"] = speaker
                     break
 
+        for s in segments:
+            mid = (s["start"] + s["end"]) / 2
+            for seg_start, seg_end, speaker in dia_segments:
+                if seg_start <= mid <= seg_end:
+                    s["speaker"] = speaker
+                    break
+
         del pipeline  # Explicitly release the pyannote model reference
-        return words
+        return words, segments
 
     def render(self, painter: QPainter, time_ns: int) -> None:
         if not self._enabled or not self._words or not self.recording:
             return
 
-        rec_start = self.recording.start_time
+        rec_start = getattr(self.recording, "start_time", 0)
         time_s = (time_ns - rec_start) / 1e9
 
         CONTEXT_BEFORE = 3
@@ -847,7 +985,8 @@ class TranscribePlugin(Plugin):
 
         active_idx = None
         for i, w in enumerate(self._words):
-            if w["start"] <= time_s <= w["end"]:
+            # 0.4s trailing hold window prevents subtitle flickering during natural pauses
+            if w["start"] <= time_s <= (w["end"] + 0.4):
                 active_idx = i
                 break
 
