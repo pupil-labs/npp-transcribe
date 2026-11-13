@@ -33,6 +33,7 @@ import logging
 import sys
 import tempfile
 from collections.abc import Generator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -59,6 +60,29 @@ from qt_property_widgets.utilities import (
     action_params,
     property_params,
 )
+
+if isinstance(property_params, type):
+    _PARAMS_FROZEN = bool(
+        getattr(
+            getattr(property_params, "__dataclass_params__", None),
+            "frozen",
+            False,
+        )
+    )
+
+    @dataclass(frozen=_PARAMS_FROZEN)
+    class custom_property_params(property_params):
+        enable_prop: str | None = None
+        expanded: bool | None = None
+        widget_class: type | None = None
+
+        def __post_init__(self) -> None:
+            if hasattr(super(), "__post_init__"):
+                super().__post_init__()
+            if (self.widget is None or self.widget == "auto") and self.widget_class is not None:
+                self.widget = self.widget_class
+
+    property_params = custom_property_params
 from qt_property_widgets.widgets import (
     BoolWidget,
     ColorWidget,
